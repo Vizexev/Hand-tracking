@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>HandVision</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#000; color:#e0f0ff; font-family:'Courier New',monospace; overflow:hidden; height:100dvh; display:flex; flex-direction:column; }
+
+#container { position:relative; flex:1; overflow:hidden; background:#000; }
+#video { position:absolute; width:100%; height:100%; object-fit:cover; }
+#canvas { position:absolute; width:100%; height:100%; }
+
+#overlay { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; background:#050a0f; z-index:10; transition:opacity 0.4s; }
+#overlay.hidden { opacity:0; pointer-events:none; }
+.logo { font-size:56px; animation:pulse 2s ease-in-out infinite; }
+@keyframes pulse { 0%,100%{transform:scale(1)} 50%{transform:scale(1.08)} }
+.title { font-size:20px; font-weight:bold; letter-spacing:3px; color:#00e5ff; }
+.sub { font-size:11px; color:#4a7a8a; letter-spacing:1px; }
+#startBtn { background:transparent; border:1px solid #00e5ff; color:#00e5ff; font-family:'Courier New',monospace; font-size:13px; letter-spacing:2px; padding:11px 28px; cursor:pointer; border-radius:2px; }
+#startBtn:disabled { opacity:0.3; cursor:default; }
+#log { font-size:11px; color:#2a9a6a; max-width:280px; text-align:center; line-height:1.6; min-height:32px; padding:0 16px; }
+#log.err { color:#ff5555; }
+
+/* HUD top */
+#hud { position:absolute; top:0; left:0; right:0; padding:8px 10px; display:flex; justify-content:space-between; align-items:flex-start; z-index:5; pointer-events:none; }
+.hbox { background:#000000bb; border:1px solid #00e5ff22; border-radius:4px; padding:4px 9px; font-size:10px; color:#00e5ff66; text-align:center; }
+.hval { color:#00e5ff; font-size:16px; font-weight:bold; display:block; }
+
+/* Camera switch button */
+#camBtn { position:absolute; bottom:12px; right:12px; z-index:6; background:#000000cc; border:1px solid #00e5ff44; color:#00e5ff; font-size:22px; width:48px; height:48px; border-radius:50%; cursor:pointer; display:none; align-items:center; justify-content:center; }
+#camBtn.visible { display:flex; }
+
+#bottom { background:#080f17; border-top:1px solid #0a2030; padding:7px 10px; display:flex; gap:7px; flex-shrink:0; }
+.stat { flex:1; text-align:center; background:#0a1a24; border:1px solid #0d2535; border-radius:4px; padding:5px 2px; }
+.slabel { font-size:9px; color:#2a5060; letter-spacing:1px; text-transform:uppercase; }
+.sval { font-size:18px; color:#00e5ff; font-weight:bold; display:block; }
+</style>
+</head>
+<body>
+
+<div id="container">
+  <video id="video" playsinline autoplay muted></video>
+  <canvas id="canvas"></canvas>
+
+  <div id="overlay">
+    <div class="logo">🖐</div>
+    <div class="title">HANDVISION</div>
+    <div class="sub">TensorFlow.js · Real-time</div>
+    <button id="startBtn">[ ЗАПУСТИТЬ ]</button>
+    <div id="log">Нажми для запуска</div>
+  </div>
+
+  <div id="hud">
+    <div class="hbox">РУКИ<br><span class="hval" id="handCount">—</span></div>
+    <div class="hbox">FPS<br><span class="hval" id="fpsVal">—</span></div>
+  </div>
+
+  <button id="camBtn" title="Переключить камеру">🔄</button>
+</div>
+
+<div id="bottom">
+  <div class="stat"><span class="slabel">Пальцев</span><span class="sval" id="fingers">—</span></div>
+  <div class="stat"><span class="slabel">Жест</span><span class="sval" id="gesture">—</span></div>
+  <div class="stat"><span class="slabel">Камера</span><span class="sval" id="camLabel" style="font-size:11px;padding-top:4px">—</span></div>
+</div>
+
+<script>
+function loadScript(src) {
+  return new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = src; s.onload = res;
+    s.onerror = () => rej(new Error('Ошибка загрузки: ' + src));
+    document.head.appendChild(s);
+  });
+}
+
+const $ = id => document.getElementById(id);
+const log = (msg, err) => { $('log').textContent = msg; $('log').className = err ? 'err' : ''; };
+
+const CONNECTIONS = [
+  [0,1],[1,2],[2,3],[3,4],
+  [0,5],[5,6],[6,7],[7,8],
+  [0,9],[9,10],[10,11],[11,12],
+  [0,13],[13,14],[14,15],[15,16],
+  [0,17],[17,18],[18,19],[19,20],
+  [5,9],[9,13],[13,17]
+];
+const TIPS = [4,8,12,16,20];
+const GESTURES = ['✊','☝️','✌️','🤟','🖖','✋'];
+
+// Предварительно вычисленные индексы соединений
+const CONN_A = CONNECTIONS.map(c => c[0]);
+const CONN_B = CONNECTIONS.map(c => c[1]);
+
+function countFingers(kp) {
+  let n = kp[4][0] > kp[3][0] ? 1 : 0;
+  for (let i = 1; i < 5; i++) {
+    if (kp[TIPS[i]][1] < kp[TIPS[i]-2][1]) n++;
+  }
+  return n;
+}
+
+// Offscreen canvas для быстрой отрисовки
+let offscreen = null, offCtx = null;
+
+function drawHand(kp, vW, vH, W, H, facingUser) {
+  if (!offscreen || offscreen.width !== W || offscreen.height !== H) {
+    offscreen = new OffscreenCanvas(W, H);
+    offCtx = offscreen.getContext('2d');
+  }
+  offCtx.clearRect(0, 0, W, H);
+
+  const scaleX = W / vW;
+  const scaleY = H / vH;
+
+  // Flip X если фронталка
+  const fx = facingUser ? (x) => W - x * scaleX : (x) => x * scaleX;
+  const fy = (y) => y * scaleY;
+
+  // Соединения одним path
+  offCtx.beginPath();
+  offCtx.strokeStyle = '#00e5ffaa';
+  offCtx.lineWidth = 2;
+  for (let i = 0; i < CONNECTIONS.length; i++) {
+    const a = kp[CONN_A[i]], b = kp[CONN_B[i]];
+    offCtx.moveTo(fx(a[0]), fy(a[1]));
+    offCtx.lineTo(fx(b[0]), fy(b[1]));
+  }
+  offCtx.stroke();
+
+  // Точки
+  for (let i = 0; i < 21; i++) {
+    const x = fx(kp[i][0]), y = fy(kp[i][1]);
+    const tip = TIPS.includes(i);
+    offCtx.beginPath();
+    offCtx.arc(x, y, tip ? 7 : 3.5, 0, 6.283);
+    offCtx.fillStyle = tip ? '#00e5ff' : '#ffffff55';
+    offCtx.fill();
+  }
+
+  // Кончики — обводка
+  offCtx.strokeStyle = '#00e5ff55';
+  offCtx.lineWidth = 1;
+  for (let i = 0; i < 5; i++) {
+    const x = fx(kp[TIPS[i]][0]), y = fy(kp[TIPS[i]][1]);
+    offCtx.beginPath();
+    offCtx.arc(x, y, 12, 0, 6.283);
+    offCtx.stroke();
+  }
+
+  return offscreen;
+}
+
+let model = null, running = false;
+let facingUser = true;
+let stream = null;
+let lastT = 0, fCount = 0;
+let animId = null;
+
+const video = $('video');
+const canvas = $('canvas');
+const ctx = canvas.getContext('2d');
+
+function resizeCanvas() {
+  const c = $('container');
+  canvas.width = c.offsetWidth;
+  canvas.height = c.offsetHeight;
+}
+resizeCanvas();
+window.addEventListener('resize', resizeCanvas);
+
+async function startCamera(facing) {
+  if (stream) {
+    stream.getTracks().forEach(t => t.stop());
+  }
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: {
+      facingMode: facing ? 'user' : 'environment',
+      width: {ideal: 640}, height: {ideal: 480}
+    }
+  });
+  video.srcObject = stream;
+  // Зеркало только для фронталки
+  video.style.transform = facing ? 'scaleX(-1)' : 'scaleX(1)';
+  canvas.style.transform = 'scaleX(1)'; // canvas рисуем сами
+  await video.play();
+  $('camLabel').textContent = facing ? '📷 Фронт' : '📸 Задняя';
+}
+
+async function loop() {
+  if (!running) return;
+
+  let predictions;
+  try {
+    predictions = await model.estimateHands(video);
+  } catch(e) {
+    animId = requestAnimationFrame(loop);
+    return;
+  }
+
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  // FPS
+  fCount++;
+  const now = performance.now();
+  if (now - lastT >= 1000) {
+    $('fpsVal').textContent = fCount;
+    fCount = 0; lastT = now;
+  }
+
+  $('handCount').textContent = predictions.length;
+
+  if (predictions.length > 0) {
+    const kp = predictions[0].landmarks;
+    const vW = video.videoWidth || 640;
+    const vH = video.videoHeight || 480;
+
+    const off = drawHand(kp, vW, vH, W, H, facingUser);
+    ctx.drawImage(off, 0, 0);
+
+    const n = countFingers(kp);
+    $('fingers').textContent = n;
+    $('gesture').textContent = GESTURES[Math.min(n,5)];
+  } else {
+    $('fingers').textContent = '—';
+    $('gesture').textContent = '—';
+  }
+
+  animId = requestAnimationFrame(loop);
+}
+
+// Переключение камеры
+$('camBtn').addEventListener('click', async () => {
+  facingUser = !facingUser;
+  try {
+    await startCamera(facingUser);
+  } catch(e) {
+    log('Камера недоступна', true);
+    facingUser = !facingUser;
+  }
+});
+
+$('startBtn').addEventListener('click', async () => {
+  $('startBtn').disabled = true;
+  try {
+    log('📷 Запрашиваю камеру...');
+    await startCamera(facingUser);
+    log('⬇️ Загружаю TensorFlow.js...');
+
+    await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js');
+    log('⬇️ Загружаю модель рук...');
+
+    await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow-models/handpose@0.0.7/dist/handpose.js');
+    log('🔧 Инициализация...');
+
+    model = await handpose.load({ maxContinuousChecks: 5, detectionConfidence: 0.8 });
+
+    $('overlay').classList.add('hidden');
+    $('camBtn').classList.add('visible');
+    running = true;
+    lastT = performance.now();
+    loop();
+
+  } catch(e) {
+    log('❌ ' + e.message, true);
+    $('startBtn').disabled = false;
+  }
+});
+</script>
+</body>
+</html>
