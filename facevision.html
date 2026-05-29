@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>FaceVision</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#000; color:#e0f0ff; font-family:'Courier New',monospace; overflow:hidden; height:100dvh; display:flex; flex-direction:column; }
+
+#container { position:relative; flex:1; overflow:hidden; background:#000; }
+#video { position:absolute; width:100%; height:100%; object-fit:cover; }
+#canvas { position:absolute; width:100%; height:100%; }
+
+#overlay { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; background:#050a0f; z-index:10; transition:opacity 0.4s; }
+#overlay.hidden { opacity:0; pointer-events:none; }
+.logo { font-size:56px; animation:pulse 2s ease-in-out infinite; }
+@keyframes pulse { 0%,100%{transform:scale(1)} 50%{transform:scale(1.08)} }
+.title { font-size:20px; font-weight:bold; letter-spacing:3px; color:#00e5ff; }
+.sub { font-size:11px; color:#4a7a8a; letter-spacing:1px; }
+#startBtn { background:transparent; border:1px solid #00e5ff; color:#00e5ff; font-family:'Courier New',monospace; font-size:13px; letter-spacing:2px; padding:11px 28px; cursor:pointer; border-radius:2px; transition: background 0.2s; }
+#startBtn:hover:not(:disabled) { background:#00e5ff18; }
+#startBtn:disabled { opacity:0.3; cursor:default; }
+#log { font-size:11px; color:#2a9a6a; max-width:280px; text-align:center; line-height:1.6; min-height:32px; padding:0 16px; }
+#log.err { color:#ff5555; }
+
+/* HUD top */
+#hud { position:absolute; top:0; left:0; right:0; padding:8px 10px; display:flex; justify-content:space-between; align-items:flex-start; z-index:5; pointer-events:none; }
+.hbox { background:#000000bb; border:1px solid #00e5ff22; border-radius:4px; padding:4px 9px; font-size:10px; color:#00e5ff66; text-align:center; }
+.hval { color:#00e5ff; font-size:16px; font-weight:bold; display:block; }
+
+/* Camera switch button */
+#camBtn { position:absolute; bottom:12px; right:12px; z-index:6; background:#000000cc; border:1px solid #00e5ff44; color:#00e5ff; font-size:22px; width:48px; height:48px; border-radius:50%; cursor:pointer; display:none; align-items:center; justify-content:center; transition: background 0.2s; }
+#camBtn:hover { background:#00e5ff18; }
+#camBtn.visible { display:flex; }
+
+#bottom { background:#080f17; border-top:1px solid #0a2030; padding:7px 10px; display:flex; gap:7px; flex-shrink:0; }
+.stat { flex:1; text-align:center; background:#0a1a24; border:1px solid #0d2535; border-radius:4px; padding:5px 2px; }
+.slabel { font-size:9px; color:#2a5060; letter-spacing:1px; text-transform:uppercase; }
+.sval { font-size:18px; color:#00e5ff; font-weight:bold; display:block; }
+</style>
+</head>
+<body>
+
+<div id="container">
+  <video id="video" playsinline autoplay muted></video>
+  <canvas id="canvas"></canvas>
+
+  <div id="overlay">
+    <div class="logo">👁</div>
+    <div class="title">FACEVISION</div>
+    <div class="sub">TensorFlow.js · Face Landmarks · Real-time</div>
+    <button id="startBtn">[ ЗАПУСТИТЬ ]</button>
+    <div id="log">Нажми для запуска</div>
+  </div>
+
+  <div id="hud">
+    <div class="hbox">ЛИЦА<br><span class="hval" id="faceCount">—</span></div>
+    <div class="hbox">FPS<br><span class="hval" id="fpsVal">—</span></div>
+  </div>
+
+  <button id="camBtn" title="Переключить камеру">🔄</button>
+</div>
+
+<div id="bottom">
+  <div class="stat"><span class="slabel">Эмоция</span><span class="sval" id="emotion">—</span></div>
+  <div class="stat"><span class="slabel">Поворот</span><span class="sval" id="headYaw" style="font-size:13px;padding-top:3px">—</span></div>
+  <div class="stat"><span class="slabel">Камера</span><span class="sval" id="camLabel" style="font-size:11px;padding-top:4px">—</span></div>
+</div>
+
+<script>
+function loadScript(src) {
+  return new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = src; s.onload = res;
+    s.onerror = () => rej(new Error('Ошибка загрузки: ' + src));
+    document.head.appendChild(s);
+  });
+}
+
+const $ = id => document.getElementById(id);
+const log = (msg, err) => { $('log').textContent = msg; $('log').className = err ? 'err' : ''; };
+
+// ─── Индексы ключевых точек FaceMesh (468 точек) ───────────────────────────
+// Контур лица
+const FACE_OVAL = [10,338,297,332,284,251,389,356,454,323,361,288,397,365,379,378,400,377,152,148,176,149,150,136,172,58,132,93,234,127,162,21,54,103,67,109];
+// Левый глаз
+const LEFT_EYE = [33,7,163,144,145,153,154,155,133,173,157,158,159,160,161,246];
+// Правый глаз
+const RIGHT_EYE = [362,382,381,380,374,373,372,371,368,264,293,296,336,334,293,362];
+// Губы (внешний контур)
+const LIPS_OUTER = [61,185,40,39,37,0,267,269,270,409,291,375,321,405,314,17,84,181,91,146];
+// Губы (внутренний)
+const LIPS_INNER = [78,191,80,81,82,13,312,311,310,415,308,324,318,402,317,14,87,178,88,95];
+// Левая бровь
+const LEFT_BROW = [70,63,105,66,107,55,65,52,53,46];
+// Правая бровь
+const RIGHT_BROW = [300,293,334,296,336,285,295,282,283,276];
+// Нос
+const NOSE = [168,6,197,195,5,4,1,19,94,2];
+
+// Индексы для анализа
+const LEFT_EYE_TOP = 159, LEFT_EYE_BOT = 145;
+const RIGHT_EYE_TOP = 386, RIGHT_EYE_BOT = 374;
+const MOUTH_LEFT = 61, MOUTH_RIGHT = 291;
+const MOUTH_TOP = 13, MOUTH_BOT = 14;
+const BROW_LEFT = 107, BROW_RIGHT = 336;
+const NOSE_TIP = 1;
+const LEFT_CHEEK = 234, RIGHT_CHEEK = 454;
+const CHIN = 152, FOREHEAD = 10;
+
+let model = null, running = false;
+let facingUser = true;
+let stream = null;
+let lastT = 0, fCount = 0;
+let animId = null;
+
+const video = $('video');
+const canvas = $('canvas');
+const ctx = canvas.getContext('2d');
+
+function resizeCanvas() {
+  const c = $('container');
+  canvas.width = c.offsetWidth;
+  canvas.height = c.offsetHeight;
+}
+resizeCanvas();
+window.addEventListener('resize', resizeCanvas);
+
+// ─── Отрисовка лица ──────────────────────────────────────────────────────────
+function project(kp, idx, vW, vH, W, H, flip) {
+  const p = kp[idx];
+  const x = flip ? W - (p[0] / vW) * W : (p[0] / vW) * W;
+  const y = (p[1] / vH) * H;
+  return [x, y];
+}
+
+function drawContour(kp, indices, vW, vH, W, H, flip, color, width, close) {
+  if (!indices.length) return;
+  ctx.beginPath();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  const [sx, sy] = project(kp, indices[0], vW, vH, W, H, flip);
+  ctx.moveTo(sx, sy);
+  for (let i = 1; i < indices.length; i++) {
+    const [x, y] = project(kp, indices[i], vW, vH, W, H, flip);
+    ctx.lineTo(x, y);
+  }
+  if (close) ctx.closePath();
+  ctx.stroke();
+}
+
+function drawMeshDots(kp, vW, vH, W, H, flip) {
+  // Редкая сетка — рисуем каждую 3-ю точку
+  ctx.fillStyle = '#00e5ff18';
+  for (let i = 0; i < kp.length; i += 3) {
+    const [x, y] = project(kp, i, vW, vH, W, H, flip);
+    ctx.beginPath();
+    ctx.arc(x, y, 1, 0, 6.283);
+    ctx.fill();
+  }
+}
+
+function drawFace(kp, vW, vH, W, H, flip) {
+  // Сетка точек
+  drawMeshDots(kp, vW, vH, W, H, flip);
+
+  // Овал лица
+  drawContour(kp, FACE_OVAL, vW, vH, W, H, flip, '#00e5ff55', 1.5, true);
+
+  // Глаза
+  drawContour(kp, LEFT_EYE, vW, vH, W, H, flip, '#00e5ffcc', 1.5, true);
+  drawContour(kp, RIGHT_EYE, vW, vH, W, H, flip, '#00e5ffcc', 1.5, true);
+
+  // Брови
+  drawContour(kp, LEFT_BROW, vW, vH, W, H, flip, '#00e5ff88', 1.5, false);
+  drawContour(kp, RIGHT_BROW, vW, vH, W, H, flip, '#00e5ff88', 1.5, false);
+
+  // Нос
+  drawContour(kp, NOSE, vW, vH, W, H, flip, '#00e5ff66', 1, false);
+
+  // Губы
+  drawContour(kp, LIPS_OUTER, vW, vH, W, H, flip, '#00e5ffbb', 1.5, true);
+  drawContour(kp, LIPS_INNER, vW, vH, W, H, flip, '#00e5ff66', 1, true);
+
+  // Ключевые точки (яркие)
+  const keyPts = [NOSE_TIP, LEFT_EYE_TOP, RIGHT_EYE_TOP, MOUTH_LEFT, MOUTH_RIGHT, CHIN, FOREHEAD];
+  for (const idx of keyPts) {
+    const [x, y] = project(kp, idx, vW, vH, W, H, flip);
+    ctx.beginPath();
+    ctx.arc(x, y, 4, 0, 6.283);
+    ctx.fillStyle = '#00e5ff';
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(x, y, 9, 0, 6.283);
+    ctx.strokeStyle = '#00e5ff44';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+}
+
+// ─── Анализ лица ────────────────────────────────────────────────────────────
+function analyzeFace(kp) {
+  // Открытость рта
+  const mTop = kp[MOUTH_TOP], mBot = kp[MOUTH_BOT];
+  const mLeft = kp[MOUTH_LEFT], mRight = kp[MOUTH_RIGHT];
+  const mHeight = Math.abs(mBot[1] - mTop[1]);
+  const mWidth = Math.abs(mRight[0] - mLeft[0]);
+  const mouthRatio = mHeight / (mWidth || 1);
+
+  // Открытость глаз
+  const lEyeH = Math.abs(kp[LEFT_EYE_TOP][1] - kp[LEFT_EYE_BOT][1]);
+  const rEyeH = Math.abs(kp[RIGHT_EYE_TOP][1] - kp[RIGHT_EYE_BOT][1]);
+  const eyeW = Math.abs(kp[133][0] - kp[33][0]); // ширина глаза
+  const eyeOpenness = (lEyeH + rEyeH) / 2 / (eyeW || 1);
+
+  // Положение бровей
+  const lBrow = kp[BROW_LEFT], rBrow = kp[BROW_RIGHT];
+  const lEyeCenter = [(kp[33][0]+kp[133][0])/2, (kp[159][1]+kp[145][1])/2];
+  const rEyeCenter = [(kp[362][0]+kp[263][0])/2, (kp[386][1]+kp[374][1])/2];
+  const lBrowLift = lEyeCenter[1] - lBrow[1];
+  const rBrowLift = rEyeCenter[1] - rBrow[1];
+  const browLift = (lBrowLift + rBrowLift) / 2;
+
+  // Поворот головы (yaw) по положению носа относительно щёк
+  const leftCheekX = kp[LEFT_CHEEK][0];
+  const rightCheekX = kp[RIGHT_CHEEK][0];
+  const noseX = kp[NOSE_TIP][0];
+  const faceWidth = rightCheekX - leftCheekX;
+  const noseRelPos = faceWidth > 0 ? (noseX - leftCheekX) / faceWidth : 0.5;
+  // 0 = смотрит вправо, 0.5 = прямо, 1 = смотрит влево
+  const yawDeg = Math.round((noseRelPos - 0.5) * 140);
+
+  // Наклон (pitch) по Y-позиции носа
+  const chinY = kp[CHIN][1], foreheadY = kp[FOREHEAD][1];
+  const faceHeight = chinY - foreheadY;
+  const noseY = kp[NOSE_TIP][1];
+  const pitchRel = faceHeight > 0 ? (noseY - foreheadY) / faceHeight : 0.5;
+  const pitchDeg = Math.round((pitchRel - 0.55) * 120);
+
+  // Определение эмоции
+  let emotion = '😐';
+  if (mouthRatio > 0.25) {
+    emotion = '😮'; // рот открыт
+  } else if (browLift > eyeW * 0.25 && mouthRatio < 0.08) {
+    emotion = '😲'; // брови подняты
+  } else if (eyeOpenness < 0.08) {
+    emotion = '😑'; // прищур/моргание
+  } else if (browLift < eyeW * 0.1 && mouthRatio > 0.05) {
+    emotion = '😄'; // улыбка + нейтральные брови
+  } else if (browLift < eyeW * 0.12) {
+    emotion = '😠'; // брови нахмурены
+  }
+
+  let yawLabel = '⬆ Прямо';
+  if (yawDeg < -20) yawLabel = '◀ Влево';
+  else if (yawDeg > 20) yawLabel = '▶ Вправо';
+  if (pitchDeg < -15) yawLabel += ' ↓';
+  else if (pitchDeg > 15) yawLabel += ' ↑';
+
+  return { emotion, yawLabel };
+}
+
+// ─── Камера ──────────────────────────────────────────────────────────────────
+async function startCamera(facing) {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: facing ? 'user' : 'environment', width:{ideal:640}, height:{ideal:480} }
+  });
+  video.srcObject = stream;
+  video.style.transform = facing ? 'scaleX(-1)' : 'scaleX(1)';
+  canvas.style.transform = 'scaleX(1)';
+  await video.play();
+  $('camLabel').textContent = facing ? '📷 Фронт' : '📸 Задняя';
+}
+
+// ─── Главный цикл ────────────────────────────────────────────────────────────
+async function loop() {
+  if (!running) return;
+
+  let predictions;
+  try {
+    predictions = await model.estimateFaces(video);
+  } catch(e) {
+    animId = requestAnimationFrame(loop);
+    return;
+  }
+
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  fCount++;
+  const now = performance.now();
+  if (now - lastT >= 1000) {
+    $('fpsVal').textContent = fCount;
+    fCount = 0; lastT = now;
+  }
+
+  $('faceCount').textContent = predictions.length;
+
+  if (predictions.length > 0) {
+    const face = predictions[0];
+    const kp = face.scaledMesh || face.mesh;
+    const vW = video.videoWidth || 640;
+    const vH = video.videoHeight || 480;
+
+    drawFace(kp, vW, vH, W, H, facingUser);
+
+    const { emotion, yawLabel } = analyzeFace(kp);
+    $('emotion').textContent = emotion;
+    $('headYaw').textContent = yawLabel;
+  } else {
+    $('emotion').textContent = '—';
+    $('headYaw').textContent = '—';
+  }
+
+  animId = requestAnimationFrame(loop);
+}
+
+// ─── Кнопки ─────────────────────────────────────────────────────────────────
+$('camBtn').addEventListener('click', async () => {
+  facingUser = !facingUser;
+  try { await startCamera(facingUser); }
+  catch(e) { log('Камера недоступна', true); facingUser = !facingUser; }
+});
+
+$('startBtn').addEventListener('click', async () => {
+  $('startBtn').disabled = true;
+  try {
+    log('📷 Запрашиваю камеру...');
+    await startCamera(facingUser);
+    log('⬇️ Загружаю TensorFlow.js...');
+    await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js');
+    log('⬇️ Загружаю модель лица...');
+    await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow-models/face-landmarks-detection@0.0.3/dist/face-landmarks-detection.js');
+    log('🔧 Инициализация...');
+
+    model = await faceLandmarksDetection.load(
+      faceLandmarksDetection.SupportedPackages.mediapipeFacemesh,
+      { maxFaces: 2, shouldLoadIrisModel: false }
+    );
+
+    $('overlay').classList.add('hidden');
+    $('camBtn').classList.add('visible');
+    running = true;
+    lastT = performance.now();
+    loop();
+
+  } catch(e) {
+    log('❌ ' + e.message, true);
+    $('startBtn').disabled = false;
+  }
+});
+</script>
+</body>
+</html>
